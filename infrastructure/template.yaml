@@ -1,0 +1,824 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'S3 Annotations Data Lineage Solution - Healthcare Compliance Demo'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: data-lineage-demo
+    Description: Project name for resource naming
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+Resources:
+  # ============================================
+  # S3 Access Logging Bucket
+  # ============================================
+
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-access-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: Purpose
+          Value: AccessLogs
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LoggingBucket.Arn
+              - !Sub '${LoggingBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ============================================
+  # S3 Buckets for Medallion Architecture
+  # ============================================
+
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LoggingBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-bronze-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: bronze/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      MetadataConfiguration:
+        JournalTableConfiguration:
+          RecordExpiration:
+            Expiration: ENABLED
+            Days: 30
+        AnnotationTableConfiguration:
+          ConfigurationState: ENABLED
+          Role: !GetAtt S3MetadataRole.Arn
+      Tags:
+        - Key: Layer
+          Value: Bronze
+        - Key: DataClassification
+          Value: PHI
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LoggingBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-silver-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: silver/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      MetadataConfiguration:
+        JournalTableConfiguration:
+          RecordExpiration:
+            Expiration: ENABLED
+            Days: 30
+        AnnotationTableConfiguration:
+          ConfigurationState: ENABLED
+          Role: !GetAtt S3MetadataRole.Arn
+      Tags:
+        - Key: Layer
+          Value: Silver
+        - Key: DataClassification
+          Value: PHI
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LoggingBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-gold-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: gold/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      MetadataConfiguration:
+        JournalTableConfiguration:
+          RecordExpiration:
+            Expiration: ENABLED
+            Days: 30
+        AnnotationTableConfiguration:
+          ConfigurationState: ENABLED
+          Role: !GetAtt S3MetadataRole.Arn
+      Tags:
+        - Key: Layer
+          Value: Gold
+        - Key: DataClassification
+          Value: PHI
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-scripts-${AWS::AccountId}'
+      # T-04 Mitigation: Enable versioning on Scripts bucket to track code changes
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: scripts/
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: Scripts
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LoggingBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-athena-results-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: athena-results/
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldQueryResults
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: AthenaResults
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================
+  # S3 Bucket Policies: Enforce TLS
+  # ============================================
+
+  BronzeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BronzeBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt BronzeBucket.Arn
+              - !Sub '${BronzeBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  SilverBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SilverBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SilverBucket.Arn
+              - !Sub '${SilverBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  GoldBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GoldBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt GoldBucket.Arn
+              - !Sub '${GoldBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  ScriptsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ScriptsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ScriptsBucket.Arn
+              - !Sub '${ScriptsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  AthenaResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AthenaResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AthenaResultsBucket.Arn
+              - !Sub '${AthenaResultsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ============================================
+  # IAM Role: S3 Metadata Annotation Tables
+  # ============================================
+
+  S3MetadataRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-s3-metadata-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: metadata.s3.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: S3MetadataAnnotationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAnnotation
+                  - s3:GetObjectVersionAnnotation
+                  - s3:ListObjectAnnotations
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-bronze-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-bronze-${AWS::AccountId}/*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-silver-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-silver-${AWS::AccountId}/*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-gold-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-gold-${AWS::AccountId}/*'
+
+  # ============================================
+  # IAM Roles
+  # ============================================
+
+  LineageTrackerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lineage-tracker-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AnnotationsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # T-08 Mitigation: Restrict Lambda to Bronze bucket only (minimum necessary)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:PutObject
+                  - s3:PutObjectAnnotation
+                  - s3:GetObjectAnnotation
+                Resource:
+                  - !Sub '${BronzeBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BronzeBucket.Arn
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # T-08 Mitigation: Restrict Glue to specific actions only (no s3:*)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${BronzeBucket.Arn}/*'
+                  - !Sub '${SilverBucket.Arn}/*'
+                  - !Sub '${GoldBucket.Arn}/*'
+              # T-12 Mitigation: Scripts bucket read-only, restrict to Scripts bucket only
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub '${ScriptsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BronzeBucket.Arn
+                  - !GetAtt SilverBucket.Arn
+                  - !GetAtt GoldBucket.Arn
+                  - !GetAtt ScriptsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObjectAnnotation
+                  - s3:GetObjectAnnotation
+                  - s3:ListObjectAnnotations
+                Resource:
+                  - !Sub '${BronzeBucket.Arn}/*'
+                  - !Sub '${SilverBucket.Arn}/*'
+                  - !Sub '${GoldBucket.Arn}/*'
+
+  # ============================================
+  # Lambda Function: Lineage Tracker
+  # ============================================
+
+  LineageTrackerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-lineage-tracker'
+      Runtime: python3.13
+      Handler: lambda_lineage_tracker.lambda_handler
+      Role: !GetAtt LineageTrackerRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      # T-10 Mitigation: Limit concurrent invocations to prevent DoS
+      ReservedConcurrentExecutions: 100
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          ANNOTATION_NAME: lineage
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced during deployment
+          def lambda_handler(event, context):
+              print("Lambda function code will be deployed via deployment script")
+              return {"statusCode": 200}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LineageTrackerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LineageTrackerFunction}'
+      # T-06: Use 2557 days (valid CloudWatch value, ~7 years) for compliance
+      RetentionInDays: 2557
+
+  # ============================================
+  # EventBridge Rule: S3 Object Created
+  # ============================================
+
+  S3ObjectCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-s3-object-created'
+      Description: Trigger lineage tracking on S3 PutObject events
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref BronzeBucket
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LineageTrackerFunction.Arn
+          Id: LineageTrackerTarget
+
+  LineageTrackerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LineageTrackerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      # T-02 Mitigation: Restrict invocation to specific EventBridge rule only
+      SourceArn: !GetAtt S3ObjectCreatedRule.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  # ============================================
+  # Glue Database
+  # ============================================
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_lineage_db'
+        Description: Database for data lineage demo
+
+  # ============================================
+  # Glue Job: Bronze to Silver (HL7 to FHIR)
+  # ============================================
+
+  BronzeToSilverJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-bronze-to-silver'
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${ScriptsBucket}/glue_etl_bronze_to_silver.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': python
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${ScriptsBucket}/spark-logs/'
+        '--source_bucket': !Ref BronzeBucket
+        '--target_bucket': !Ref SilverBucket
+        '--database_name': !Ref GlueDatabase
+        '--additional-python-modules': 'boto3>=1.43.36'
+      GlueVersion: '5.0'
+      MaxRetries: 1
+      Timeout: 120
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Tags:
+        Project: !Ref ProjectName
+
+  # ============================================
+  # Glue Job: Silver to Gold (Patient 360)
+  # ============================================
+
+  SilverToGoldJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-silver-to-gold'
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${ScriptsBucket}/glue_etl_silver_to_gold.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': python
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${ScriptsBucket}/spark-logs/'
+        '--source_bucket': !Ref SilverBucket
+        '--target_bucket': !Ref GoldBucket
+        '--database_name': !Ref GlueDatabase
+        '--additional-python-modules': 'boto3>=1.43.36'
+      GlueVersion: '5.0'
+      MaxRetries: 1
+      Timeout: 120
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Tags:
+        Project: !Ref ProjectName
+
+  # ============================================
+  # Glue Federated Catalog: S3 Tables Integration
+  # ============================================
+
+  S3TablesCatalog:
+    Type: AWS::Glue::Catalog
+    Properties:
+      Name: s3tablescatalog
+      FederatedCatalog:
+        Identifier: !Sub 'arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/*'
+        ConnectionName: 'aws:s3tables'
+      CreateDatabaseDefaultPermissions:
+        - Principal:
+            DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+          Permissions:
+            - ALL
+      CreateTableDefaultPermissions:
+        - Principal:
+            DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+          Permissions:
+            - ALL
+      AllowFullTableExternalDataAccess: 'True'
+
+  # ============================================
+  # Athena Workgroup
+  # ============================================
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-lineage-queries'
+      Description: Workgroup for querying S3 annotation tables
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/query-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================
+  # CloudTrail: S3 Data Events Logging
+  # ============================================
+
+  CloudTrailLogBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LoggingBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudtrail-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: cloudtrail/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years for compliance
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CloudTrailLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailLogBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CloudTrailLogBucket.Arn
+              - !Sub '${CloudTrailLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  DataLineageAuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailLogBucketPolicy
+    Properties:
+      TrailName: !Sub '${ProjectName}-audit-trail'
+      S3BucketName: !Ref CloudTrailLogBucket
+      IncludeGlobalServiceEvents: false
+      IsLogging: true
+      IsMultiRegionTrail: false
+      # T-05 Mitigation: Enable S3 data events for annotation operations
+      EventSelectors:
+        - IncludeManagementEvents: false
+          ReadWriteType: All
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub '${BronzeBucket.Arn}/*'
+                - !Sub '${SilverBucket.Arn}/*'
+                - !Sub '${GoldBucket.Arn}/*'
+      # T-05 Mitigation: Enable log file validation for integrity
+      EnableLogFileValidation: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for excessive annotation operations (T-03)
+  AnnotationTamperingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-annotation-tampering'
+      AlarmDescription: Alert on excessive annotation modifications
+      MetricName: PutObject
+      Namespace: AWS/S3
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref BronzeBucket
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda invocation flood (T-10)
+  LambdaFloodAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-flood'
+      AlarmDescription: Alert on excessive Lambda invocations (potential DoS)
+      MetricName: Invocations
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LineageTrackerFunction
+      TreatMissingData: notBreaching
+
+# ============================================
+# Outputs
+# ============================================
+
+Outputs:
+  BronzeBucketName:
+    Description: Bronze layer S3 bucket name
+    Value: !Ref BronzeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BronzeBucket'
+
+  SilverBucketName:
+    Description: Silver layer S3 bucket name
+    Value: !Ref SilverBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SilverBucket'
+
+  GoldBucketName:
+    Description: Gold layer S3 bucket name
+    Value: !Ref GoldBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-GoldBucket'
+
+  ScriptsBucketName:
+    Description: Scripts bucket name
+    Value: !Ref ScriptsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ScriptsBucket'
+
+  LineageTrackerFunctionArn:
+    Description: Lambda function ARN for lineage tracking
+    Value: !GetAtt LineageTrackerFunction.Arn
+
+  BronzeToSilverJobName:
+    Description: Glue job name for Bronze to Silver ETL
+    Value: !Ref BronzeToSilverJob
+
+  SilverToGoldJobName:
+    Description: Glue job name for Silver to Gold ETL
+    Value: !Ref SilverToGoldJob
+
+  AthenaWorkgroupName:
+    Description: Athena workgroup for lineage queries
+    Value: !Ref AthenaWorkgroup
+
+  GlueDatabaseName:
+    Description: Glue database name
+    Value: !Ref GlueDatabase

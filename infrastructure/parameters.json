@@ -1,0 +1,6 @@
+{
+  "Parameters": {
+    "ProjectName": "data-lineage-demo",
+    "Environment": "dev"
+  }
+}

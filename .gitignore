@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Sample data
+sample_data/
+
+# AWS
+*.zip
+
+# IDE / tooling
+.vscode/
+.idea/
+.kiro/
+.threatmodel/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+docs/
